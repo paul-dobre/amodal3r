@@ -196,6 +196,7 @@ class Amodal3RImageTo3DPipeline(Pipeline):
         cond: dict,
         num_samples: int = 1,
         sampler_params: dict = {},
+        save_steps: bool = False,
     ) -> torch.Tensor:
         """
         Sample sparse structures with the given conditioning.
@@ -204,13 +205,14 @@ class Amodal3RImageTo3DPipeline(Pipeline):
             cond (dict): The conditioning information.
             num_samples (int): The number of samples to generate.
             sampler_params (dict): Additional parameters for the sampler.
+            save_steps (bool): Whether to return per-step sparse voxel coordinates.
         """
         # Sample occupancy latent
         flow_model = self.models['sparse_structure_flow_model']
         reso = flow_model.resolution
         noise = torch.randn(num_samples, flow_model.in_channels, reso, reso, reso).to(self.device)
         sampler_params = {**self.sparse_structure_sampler_params, **sampler_params}
-        z_s = self.sparse_structure_sampler.sample(
+        sampler_output = self.sparse_structure_sampler.sample(
             flow_model,
             noise,
             **cond,
@@ -218,9 +220,16 @@ class Amodal3RImageTo3DPipeline(Pipeline):
             verbose=True
         ).samples
         decoder = self.models['sparse_structure_decoder']
-        ss = decoder(z_s)
+        ss = decoder(sampler_output.samples)
         coords = torch.argwhere(ss>0)[:, [0, 2, 3, 4]].int()
-        return coords
+        if not save_steps:
+            return coords
+        sparse_steps = []
+        for step_latent in sampler_output.pred_x_0:
+            step_ss = decoder(step_latent)
+            step_coords = torch.argwhere(step_ss > 0)[:, [0, 2, 3, 4]].int()
+            sparse_steps.append(step_coords)
+        return coords, sparse_steps
 
     def decode_slat(
         self,
@@ -290,6 +299,7 @@ class Amodal3RImageTo3DPipeline(Pipeline):
         slat_sampler_params: dict = {},
         formats: List[str] = ['mesh', 'gaussian'],
         preprocess_image: bool = True,
+        save_sparse_steps: bool = False,
     ) -> dict:
         """
         Run the pipeline.
@@ -305,9 +315,22 @@ class Amodal3RImageTo3DPipeline(Pipeline):
             image = self.preprocess_image(image)
         cond = self.get_cond([image])
         torch.manual_seed(seed)
-        coords = self.sample_sparse_structure(cond, num_samples, sparse_structure_sampler_params)
+
+        if save_sparse_steps:
+            coords, sparse_steps = self.sample_sparse_structure(
+                cond,
+                num_samples,
+                sparse_structure_sampler_params,
+                save_steps=True,
+            )
+        else:
+            coords = self.sample_sparse_structure(cond, num_samples, sparse_structure_sampler_params)
+
         slat = self.sample_slat(cond, coords, slat_sampler_params)
-        return self.decode_slat(slat, formats)
+        outputs = self.decode_slat(slat, formats)
+        if save_sparse_steps:
+            outputs['sparse_steps'] = sparse_steps
+        return outputs
 
     @contextmanager
     def inject_sampler_multi_image(
@@ -378,6 +401,7 @@ class Amodal3RImageTo3DPipeline(Pipeline):
         formats: List[str] = ['mesh', 'gaussian'],
         mode: Literal['stochastic', 'multidiffusion'] = 'stochastic',
         erode_kernel_size: int = 3,
+        save_sparse_steps: bool = False,
     ) -> dict:
         """
         Run the pipeline with multiple images as condition
@@ -400,8 +424,21 @@ class Amodal3RImageTo3DPipeline(Pipeline):
         torch.manual_seed(seed)
         ss_steps = {**self.sparse_structure_sampler_params, **sparse_structure_sampler_params}.get('steps')
         with self.inject_sampler_multi_image('sparse_structure_sampler', len(images), ss_steps, mode=mode):
-            coords = self.sample_sparse_structure(cond_stage_1, num_samples, sparse_structure_sampler_params)
+            if save_sparse_steps:
+                coords, sparse_steps = self.sample_sparse_structure(
+                    cond_stage_1,
+                    num_samples,
+                    sparse_structure_sampler_params,
+                    save_steps=True,
+                )
+            else:
+                coords = self.sample_sparse_structure(cond_stage_1, num_samples, sparse_structure_sampler_params)
+
+
         slat_steps = {**self.slat_sampler_params, **slat_sampler_params}.get('steps')
         with self.inject_sampler_multi_image('slat_sampler', len(images), slat_steps, mode=mode):
             slat = self.sample_slat(cond_stage_2, coords, slat_sampler_params)
-        return self.decode_slat(slat, formats)
+        outputs = self.decode_slat(slat, formats)
+        if save_sparse_steps:
+            outputs['sparse_steps'] = sparse_steps
+        return outputs
