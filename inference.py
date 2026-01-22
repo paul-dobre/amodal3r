@@ -90,13 +90,13 @@ def prepare_masks_and_image(
         flags=cv2.INTER_NEAREST, borderValue=0
     ) > 0
 
-    canvas = np.full((canvas_size, canvas_size, 3), 255, np.uint8)
-    canvas[target_w] = np.array([188, 188, 188], dtype=np.uint8)
-    canvas[occ_w] = np.array([0, 0, 0], dtype=np.uint8)
+    canvas = np.full((canvas_size, canvas_size), 255, np.uint8)
+    canvas[target_w] = np.uint8(188)
+    canvas[occ_w] = np.uint8(0)
 
 
     #converting to PIL Image for compatibility
-    canvas = Image.fromarray(canvas)
+    canvas = Image.fromarray(canvas, mode="L")
     warped_img = Image.fromarray(warped_img)
 
     return canvas, warped_img
