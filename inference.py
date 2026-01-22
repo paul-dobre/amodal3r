@@ -6,11 +6,103 @@ os.environ['SPCONV_ALGO'] = 'native'        # Can be 'native' or 'auto', default
 
 import numpy as np
 import imageio
+from pathlib import Path
 from PIL import Image
 from amodal3r.pipelines import Amodal3RImageTo3DPipeline
 from amodal3r.utils import render_utils, postprocessing_utils
 import cv2
 import trimesh
+
+scratch = os.environ["SCRATCH"]
+
+
+def prepare_masks_and_image(
+    target_mask_path,
+    occ_mask_path,
+    image_path,
+    canvas_size=518,
+    fit="downscale",
+    margin=0,
+    bg=255,
+    resize_image_if_needed=True,
+):
+    target = cv2.imread(str(target_mask_path), cv2.IMREAD_GRAYSCALE)
+    occ = cv2.imread(str(occ_mask_path), cv2.IMREAD_GRAYSCALE)
+    if target is None or occ is None:
+        raise FileNotFoundError("Could not read target or occluder mask")
+
+    target = target > 0
+    occ = occ > 0
+
+    Hm, Wm = target.shape
+
+    union = target | occ
+    if not union.any():
+        blank = np.full((canvas_size, canvas_size, 3), bg, np.uint8)
+        return blank, None, (target, occ), {
+            "scale": 1.0, "center": (0, 0), "bbox": (0, -1, 0, -1),
+            "M": np.eye(2, 3, dtype=np.float32), "margin": margin
+        }
+
+    img_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise FileNotFoundError(f"Couldn't read image: {image_path}")
+    image = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    Hi, Wi = image.shape[:2]
+    if (Hi, Wi) != (Hm, Wm) and resize_image_if_needed:
+        image = cv2.resize(image, (Wm, Hm), interpolation=cv2.INTER_LINEAR)
+
+    ys, xs = np.where(union)
+    y0, y1 = ys.min(), ys.max()
+    x0, x1 = xs.min(), xs.max()
+    h, w = (y1 - y0 + 1), (x1 - x0 + 1)
+    cy = (y0 + y1) / 2.0
+    cx = (x0 + x1) / 2.0
+
+    avail = max(1, canvas_size - 2 * margin)
+    s_fit = min(avail / h, avail / w)
+    if fit == "none":
+        s = 1.0
+    elif fit == "downscale":
+        s = min(1.0, s_fit)
+    else:
+        s = s_fit
+
+    tx = canvas_size / 2.0 - s * cx
+    ty = canvas_size / 2.0 - s * cy
+    M = np.array([[s, 0, tx], [0, s, ty]], dtype=np.float32)
+
+    warped_img = cv2.warpAffine(
+        image, M, (canvas_size, canvas_size),
+        flags=cv2.INTER_LINEAR, borderValue=(bg, bg, bg)
+    )
+
+    t_u8 = (target.astype(np.uint8) * 255)
+    o_u8 = (occ.astype(np.uint8) * 255)
+
+    target_w = cv2.warpAffine(
+        t_u8, M, (canvas_size, canvas_size),
+        flags=cv2.INTER_NEAREST, borderValue=0
+    ) > 0
+
+    occ_w = cv2.warpAffine(
+        o_u8, M, (canvas_size, canvas_size),
+        flags=cv2.INTER_NEAREST, borderValue=0
+    ) > 0
+
+    canvas = np.full((canvas_size, canvas_size, 3), 255, np.uint8)
+    canvas[target_w] = np.array([188, 188, 188], dtype=np.uint8)
+    canvas[occ_w] = np.array([0, 0, 0], dtype=np.uint8)
+
+
+    #converting to PIL Image for compatibility
+    canvas = Image.fromarray(canvas)
+    warped_img = Image.fromarray(warped_img)
+
+    return canvas, warped_img
+
+
+
 
 
 def extract_glb(gs, mesh, mesh_simplify=0.95, texture_size=1024, export_path="output.glb"):
@@ -50,13 +142,23 @@ pipeline.cuda()
 output_dir = "./output/1/"
 os.makedirs(output_dir, exist_ok=True)
 
+unc_image_dir = Path(f"{scratch}/room/output/threedfront/scene/unc_images")
+room = "Bedroom/Bedroom-1573"
+room_folder = unc_image_dir / room
+
+target_mask_path = room_folder / "000_mask_furniture_5_ddef48db-000d-4614-94c4-67ce114bb0e9_0.png"
+occ_mask_path = room_folder / "000_occlusion_furniture_5_ddef48db-000d-4614-94c4-67ce114bb0e9_0.png"
+image_path = room_folder / "000.png"
+
+canvas, warped_img = prepare_masks_and_image(target_mask_path, occ_mask_path, image_path)
+
 # can be single image or multiple images
 images = [
-    Image.open(f"./input/1/000000.png"),
+    warped_img,
 ]
 
 masks = [
-    Image.open(f"./input/1/000000_mask.png").convert("L"),
+    canvas,
 ]
 
 
@@ -74,7 +176,18 @@ outputs = pipeline.run_multi_image(
         "steps": 12,
         "cfg_strength": 3,
     },
+    save_sparse_steps=True,
 )
+
+
+sparse_structure_dir = f"{scratch}/room/output/amodal3r/sparse_structure"
+os.makedirs(sparse_structure_dir, exist_ok=True)
+
+#saving the decoded sparse voxel grids at each step
+sparse_steps = outputs['sparse_steps']
+for step_idx, coords in enumerate(sparse_steps):
+    coords_np = coords.cpu().numpy() if hasattr(coords, 'cpu') else coords
+    np.savez_compressed(os.path.join(sparse_structure_dir, f"sparse_step_{step_idx:02d}.npz"), coords=coords_np)
 
 # save as gif
 video_gs = render_utils.render_video(outputs['gaussian'][0], bg_color=(1, 1, 1))['color']
